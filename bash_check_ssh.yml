@@ -6,14 +6,14 @@
 #     DEPLOY_KEY      -> Key Store: Angel (ssh private key)
 #     DEPLOY_KEY_PASS -> Key Store: key แบบ "Login with password" เก็บ passphrase (ถ้า key มี passphrase)
 #   Environment (ไม่ลับ):
-#     TARGET_RANGE (default 10.100.2.150-10.100.2.200)  รูปแบบ: 10.100.1.1-10.100.1.50 หรือ 10.100.1.1-50
+#     TARGET_RANGE (default 10.100.2.150-10.100.2.200)  รูปแบบ: 10.100.1.50-10.100.1.70 หรือ 10.100.1.1-50
 #                  หรือเครื่องเดียว 10.100.1.50 หรือหลายช่วงคั่นด้วยเว้นวรรค/คอมมา
 #     TARGET_USER  (default angel)
 #     TARGET_PORT  (default 22)
 #     PARALLEL     (default 10)  จำนวนเครื่องที่ทดสอบพร้อมกัน
 set -u
 
-RANGE="${TARGET_RANGE:-${TARGET_HOST:-10.100.1.1-10.100.1.254}}"
+RANGE="${TARGET_RANGE:-${TARGET_HOST:-10.100.1.50-10.100.1.70}}"
 USER_SSH="${TARGET_USER:-angel}"
 PORT="${TARGET_PORT:-22}"
 PARALLEL="${PARALLEL:-10}"
