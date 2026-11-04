@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# Semaphore (Bash template) - ทดสอบ SSH authentication (publickey) ไปยังหลายเครื่อง แล้วสรุปเป็น report
+#
+# Variable Group ที่ต้องผูกกับ template:
+#   Secrets (ชนิด Environment variable):
+#     DEPLOY_KEY      -> Key Store: Angel (ssh private key)
+#     DEPLOY_KEY_PASS -> Key Store: key แบบ "Login with password" เก็บ passphrase (ถ้า key มี passphrase)
+#   Environment (ไม่ลับ):
+#     TARGET_RANGE (default 10.100.2.150-10.100.2.200)  รูปแบบ: 10.100.1.1-10.100.1.50 หรือ 10.100.1.1-50
+#                  หรือเครื่องเดียว 10.100.1.50 หรือหลายช่วงคั่นด้วยเว้นวรรค/คอมมา
+#     TARGET_USER  (default angel)
+#     TARGET_PORT  (default 22)
+#     PARALLEL     (default 10)  จำนวนเครื่องที่ทดสอบพร้อมกัน
+set -u
+
+RANGE="${TARGET_RANGE:-${TARGET_HOST:-10.100.2.150-10.100.2.200}}"
+USER_SSH="${TARGET_USER:-angel}"
+PORT="${TARGET_PORT:-22}"
+PARALLEL="${PARALLEL:-10}"
+OUT_DIR="./server_logs"
+mkdir -p "$OUT_DIR"
+
+WORK="$(mktemp -d)"
+KEY_FILE="$WORK/key"
+RES_DIR="$WORK/results"
+mkdir -p "$RES_DIR"
+cleanup() {
+  [ -n "${SSH_AGENT_PID:-}" ] && ssh-agent -k >/dev/null 2>&1
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+chmod 700 "$WORK"
+
+# ---------- 1) เตรียม private key ----------
+if [ -z "${DEPLOY_KEY:-}" ]; then
+  echo "[ERROR] ไม่พบตัวแปร DEPLOY_KEY (ผูก Variable Group ที่มี secret ชื่อ DEPLOY_KEY หรือยัง?)"
+  exit 1
+fi
+
+if [ -f "$DEPLOY_KEY" ]; then
+  cp "$DEPLOY_KEY" "$KEY_FILE"
+else
+  RAW="$DEPLOY_KEY"
+  RAW="${RAW//\\n/ }"
+  RAW="${RAW//$'\r'/ }"
+  RAW="${RAW//$'\n'/ }"
+  KEY_HEAD="$(printf '%s' "$RAW" | grep -o -E -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' | head -1)"
+  KEY_FOOT="$(printf '%s' "$RAW" | grep -o -E -e '-----END [A-Z ]*PRIVATE KEY-----' | head -1)"
+  if [ -z "$KEY_HEAD" ] || [ -z "$KEY_FOOT" ]; then
+    echo "[ERROR] DEPLOY_KEY ไม่มีส่วน -----BEGIN/END ... PRIVATE KEY----- (วาง key ไม่ครบ?)"
+    exit 1
+  fi
+  RAW="${RAW//$KEY_HEAD/}"
+  RAW="${RAW//$KEY_FOOT/}"
+  KEY_BODY="$(printf '%s' "$RAW" | tr -d ' "')"
+  {
+    printf '%s\n' "$KEY_HEAD"
+    printf '%s' "$KEY_BODY" | fold -w 70
+    printf '\n%s\n' "$KEY_FOOT"
+  } > "$KEY_FILE"
+fi
+sed -i 's/\r$//' "$KEY_FILE"
+[ -n "$(tail -c1 "$KEY_FILE")" ] && echo >> "$KEY_FILE"
+chmod 600 "$KEY_FILE"
+
+# ---------- 2) ปลดล็อก passphrase (ถ้ามี) ----------
+PASS="${DEPLOY_KEY_PASS:-}"
+[ -n "$PASS" ] && [ -f "$PASS" ] && PASS="$(cat "$PASS")"
+case "$PASS" in
+  *"PRIVATE KEY"*)
+    echo "[ERROR] DEPLOY_KEY_PASS เป็น private key ไม่ใช่ passphrase"
+    echo "        ให้สร้าง key แบบ 'Login with password' ใน Key Store แล้วให้ DEPLOY_KEY_PASS ชี้ไปที่ key นั้น"
+    exit 1 ;;
+esac
+if ! ssh-keygen -y -P "$PASS" -f "$KEY_FILE" >/dev/null 2>&1; then
+  echo "[ERROR] อ่าน key ไม่ได้: format ผิด หรือ passphrase ไม่ถูกต้อง"
+  exit 1
+fi
+
+eval "$(ssh-agent -s)" >/dev/null
+if [ -n "$PASS" ]; then
+  printf '#!/bin/sh\nprintf "%%s" "$KEY_PASS_ENV"\n' > "$WORK/askpass.sh"
+  chmod 700 "$WORK/askpass.sh"
+  KEY_PASS_ENV="$PASS" SSH_ASKPASS="$WORK/askpass.sh" SSH_ASKPASS_REQUIRE=force DISPLAY=none \
+    ssh-add "$KEY_FILE" </dev/null >/dev/null 2>&1
+else
+  ssh-add "$KEY_FILE" </dev/null >/dev/null 2>&1
+fi
+if ! ssh-add -l >/dev/null 2>&1; then
+  echo "[ERROR] ssh-add ไม่สำเร็จ (ตรวจ ssh -V ต้องเป็น OpenSSH 8.4+ ถ้ามี passphrase)"
+  exit 1
+fi
+KEY_FP="$(ssh-add -l | awk 'NR==1{print $2}')"
+rm -f "$KEY_FILE" "$WORK/askpass.sh"
+
+# ---------- 3) SSH options ----------
+SSH_OPTS=(-p "$PORT"
+  -o BatchMode=yes
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o LogLevel=ERROR
+  -o ConnectTimeout=5
+  -o NumberOfPasswordPrompts=0
+  -o PreferredAuthentications=publickey)
+# รองรับเครื่องเก่า (OpenSSH 5.3 รองรับแค่ ssh-rsa)
+SSH_OPTS+=(-o PubkeyAcceptedAlgorithms=+ssh-rsa
+  -o HostKeyAlgorithms=+ssh-rsa
+  -o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1)
+
+# ---------- 4) แปลง range เป็นรายการ IP ----------
+expand_range() {
+  local item prefix s e i
+  for item in ${1//,/ }; do
+    if [[ "$item" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)-([0-9]+\.[0-9]+\.[0-9]+\.)?([0-9]+)$ ]]; then
+      prefix="${BASH_REMATCH[1]}"; s="${BASH_REMATCH[2]}"; e="${BASH_REMATCH[4]}"
+      if [ -n "${BASH_REMATCH[3]}" ] && [ "${BASH_REMATCH[3]}" != "${prefix}." ]; then
+        echo "[ERROR] range ข้าม subnet ไม่รองรับ: $item (ต้องอยู่ใน /24 เดียวกัน)" >&2; return 1
+      fi
+      if [ "$s" -gt "$e" ] || [ "$e" -gt 255 ]; then echo "[ERROR] range ไม่ถูกต้อง: $item" >&2; return 1; fi
+      for ((i=s; i<=e; i++)); do echo "${prefix}.${i}"; done
+    elif [[ "$item" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      echo "$item"
+    else
+      echo "[ERROR] รูปแบบ range ไม่ถูกต้อง: $item" >&2; return 1
+    fi
+  done
+}
+
+HOSTS="$(expand_range "$RANGE")" || exit 1
+TOTAL=$(echo "$HOSTS" | wc -l)
+
+# ---------- 5) ทดสอบ 1 เครื่อง -> เขียนผลลง $RES_DIR/<ip> (รูปแบบ STATUS|DETAIL|ms) ----------
+# STATUS: AUTH_OK | AUTH_FAILED | PORT_CLOSED | TIMEOUT | ALGO_MISMATCH | ERROR
+check_host() {
+  local h="$1" err="$WORK/$1.err" status detail out rc t0 t1 msg
+  t0=$(date +%s%N)
+  if ! (timeout 3 bash -c "</dev/tcp/${h}/${PORT}") 2>/dev/null; then
+    status="PORT_CLOSED"; detail="port ${PORT} ปิด/ไม่ตอบสนอง (ไม่มีเครื่อง หรือถูก firewall)"
+  else
+    out="$(ssh "${SSH_OPTS[@]}" "${USER_SSH}@${h}" "hostname" 2>"$err" </dev/null)"; rc=$?
+    if [ $rc -eq 0 ]; then
+      status="AUTH_OK"; detail="login สำเร็จ, hostname=$(echo "$out" | head -1)"
+    else
+      msg="$(head -3 "$err" | tr '\n|' '  ')"
+      case "$msg" in
+        *"Permission denied"*)            status="AUTH_FAILED";   detail="key ไม่ถูกยอมรับ (ยังไม่ได้วาง public key / user ผิด / สิทธิ์ ~/.ssh ผิด)" ;;
+        *"timed out"*)                    status="TIMEOUT";       detail="เชื่อมต่อ timeout" ;;
+        *"no matching"*|*"Unable to negotiate"*) status="ALGO_MISMATCH"; detail="algorithm ไม่ตรงกัน: ${msg}" ;;
+        *)                                status="ERROR";         detail="${msg:-exit code $rc}" ;;
+      esac
+    fi
+  fi
+  t1=$(date +%s%N)
+  echo "${status}|${detail}|$(( (t1 - t0) / 1000000 ))" > "$RES_DIR/$h"
+}
+
+echo "=================================================================="
+echo "  SSH AUTHENTICATION TEST"
+echo "=================================================================="
+echo "  เป้าหมาย : $RANGE ($TOTAL เครื่อง)"
+echo "  User     : $USER_SSH    Port: $PORT    Method: publickey"
+echo "  Key      : $KEY_FP"
+echo "  เริ่มเมื่อ : $(date '+%Y-%m-%d %H:%M:%S')"
+echo "=================================================================="
+echo "กำลังทดสอบ (parallel=$PARALLEL) ..."
+
+for h in $HOSTS; do
+  check_host "$h" &
+  while [ "$(jobs -rp | wc -l)" -ge "$PARALLEL" ]; do sleep 0.2; done
+done
+wait
+
+# ---------- 6) รวมผลเป็น report ----------
+declare -A CNT=([AUTH_OK]=0 [AUTH_FAILED]=0 [PORT_CLOSED]=0 [TIMEOUT]=0 [ALGO_MISMATCH]=0 [ERROR]=0)
+CSV="$OUT_DIR/ssh_auth_report.csv"
+echo "ip,status,detail,ms" > "$CSV"
+
+icon() {
+  case "$1" in
+    AUTH_OK)       echo "[ PASS ]" ;;
+    AUTH_FAILED)   echo "[ FAIL ]" ;;
+    PORT_CLOSED)   echo "[ SKIP ]" ;;
+    *)             echo "[ WARN ]" ;;
+  esac
+}
+
+echo
+echo "----------------------- รายละเอียดรายเครื่อง -----------------------"
+printf '%-16s %-9s %-15s %7s  %s\n' "IP" "RESULT" "STATUS" "TIME" "DETAIL"
+printf '%-16s %-9s %-15s %7s  %s\n' "----------------" "---------" "---------------" "-------" "------"
+for h in $HOSTS; do
+  IFS='|' read -r st dt ms < "$RES_DIR/$h"
+  CNT[$st]=$(( ${CNT[$st]:-0} + 1 ))
+  printf '%-16s %-9s %-15s %5sms  %s\n' "$h" "$(icon "$st")" "$st" "$ms" "$dt"
+  printf '%s,%s,"%s",%s\n' "$h" "$st" "${dt//\"/\'}" "$ms" >> "$CSV"
+done
+
+list_by() { for h in $HOSTS; do IFS='|' read -r st _ < "$RES_DIR/$h"; [ "$st" = "$1" ] && printf '%s ' "$h"; done; }
+
+REACHED=$(( TOTAL - CNT[PORT_CLOSED] ))
+echo
+echo "=========================== สรุปผล ==========================="
+printf '  เครื่องทั้งหมด            : %s\n' "$TOTAL"
+printf '  [ PASS ] Auth สำเร็จ       : %s\n' "${CNT[AUTH_OK]}"
+printf '  [ FAIL ] Auth ไม่ผ่าน      : %s\n' "${CNT[AUTH_FAILED]}"
+printf '  [ WARN ] Timeout/Algo/Err  : %s\n' "$(( CNT[TIMEOUT] + CNT[ALGO_MISMATCH] + CNT[ERROR] ))"
+printf '  [ SKIP ] Port %s ปิด        : %s\n' "$PORT" "${CNT[PORT_CLOSED]}"
+if [ "$REACHED" -gt 0 ]; then
+  printf '  อัตราผ่าน (เฉพาะที่เชื่อมต่อถึง %s เครื่อง): %s%%\n' "$REACHED" "$(( CNT[AUTH_OK] * 100 / REACHED ))"
+fi
+echo "---------------------------------------------------------------"
+[ "${CNT[AUTH_OK]}" -gt 0 ]       && echo "  PASS : $(list_by AUTH_OK)"
+[ "${CNT[AUTH_FAILED]}" -gt 0 ]   && echo "  FAIL : $(list_by AUTH_FAILED)" && echo "         -> ตรวจ authorized_keys ของ user $USER_SSH และสิทธิ์ ~/.ssh (700) / authorized_keys (600)"
+[ "${CNT[TIMEOUT]}" -gt 0 ]       && echo "  TIMEOUT : $(list_by TIMEOUT)"
+[ "${CNT[ALGO_MISMATCH]}" -gt 0 ] && echo "  ALGO : $(list_by ALGO_MISMATCH)"
+[ "${CNT[ERROR]}" -gt 0 ]         && echo "  ERROR: $(list_by ERROR)"
+echo "---------------------------------------------------------------"
+echo "  ไฟล์ CSV: $CSV"
+echo "  เสร็จเมื่อ: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "==============================================================="
+
+# ล้มเหลวก็ต่อเมื่อไม่มีเครื่องไหน auth ผ่านเลย
+[ "${CNT[AUTH_OK]}" -gt 0 ] || exit 1
