@@ -13,7 +13,7 @@
 #     PARALLEL     (default 10)  จำนวนเครื่องที่ทดสอบพร้อมกัน
 set -u
 
-RANGE="${TARGET_RANGE:-${TARGET_HOST:-11.100.6.1-11.100.6.254}}"
+RANGE="${TARGET_RANGE:-${TARGET_HOST:-11.100.7.1-11.100.7.254}}"
 USER_SSH="${TARGET_USER:-angel}"
 PORT="${TARGET_PORT:-22}"
 PARALLEL="${PARALLEL:-10}"
